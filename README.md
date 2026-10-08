@@ -1,6 +1,6 @@
 # MES AI Infra
 
-MES가 공유하는 플랫폼만 띄웁니다. 애플리케이션 이미지는 각 저장소에 있습니다.
+이 폴더의 `docker-compose.yml`로 플랫폼과 앱을 함께 올리고 내립니다. 앱 소스는 형제 폴더에 있어야 합니다. 예: `../backend`, `../frontend`.
 
 | 서비스 | 이미지 | 주소 | 용도 |
 | --- | --- | --- | --- |
@@ -16,7 +16,10 @@ MES가 공유하는 플랫폼만 띄웁니다. 애플리케이션 이미지는 �
 ```bash
 cp .env.example .env
 docker compose up -d --build
+docker compose down
 ```
+
+`compose.yaml`은 더 이상 쓰지 않습니다. `docker compose`는 `docker-compose.yml`만 읽습니다.
 
 MariaDB는 데이터 디렉터리가 비어 있을 때만 `mariadb/init.sql`을 실행합니다. 이미 볼륨이 있으면 `docker compose down -v` 후 다시 띄워야 스키마가 적용됩니다. 앱 백엔드는 기동 시 `create_all`도 하므로, 빈 DB에서는 둘 중 어느 쪽이 먼저여도 같은 테이블이 됩니다.
 

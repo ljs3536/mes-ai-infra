@@ -1,0 +1,257 @@
+# 전체 스택. infra 폴더에서 docker compose up / down 으로 올리고 내린다.
+# 앱 소스는 이 폴더의 형제로 있다. 예: ../backend, ../frontend.
+# db MariaDB, mqtt Mosquitto, backend MES API, frontend MES 화면,
+# emulator-a/b PLC, edge-gateway 제어 브리지, influxdb, mlflow,
+# sensor-collector 파형 저장, sensor-emulator PIEZO 파형, analytics-backend 학습·판정, analytics-frontend 분석 화면.
+name: factory-mes
+
+services:
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+      MARIADB_DATABASE: ${DB_NAME:-mes}
+      MARIADB_USER: ${DB_USER:-mes}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-mes}
+      TZ: Asia/Seoul
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./mariadb/init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_WS_PORT:-9001}:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ../backend
+    image: factory-mes/backend:local
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: mysql+pymysql://${DB_USER:-mes}:${DB_PASSWORD:-mes}@db:3306/${DB_NAME:-mes}?charset=utf8mb4
+      CORS_ORIGINS: '["http://localhost:3000"]'
+      SEED_DEMO: "true"
+      MQTT_HOST: mqtt
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      mqtt:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  frontend:
+    build: ../frontend
+    image: factory-mes/frontend:local
+    restart: unless-stopped
+    environment:
+      API_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # 설비: PLC(Modbus TCP 서버) + 부착 센서(MQTT publish)
+  emulator-a:
+    build: ../machine-emulator
+    image: factory-mes/machine-emulator:local
+    restart: unless-stopped
+    environment: &emulator-env
+      MACHINE_CODE: MACHINE_A
+      MODBUS_PORT: "5020"
+      MQTT_HOST: mqtt
+      CYCLE_SECONDS: "0.6"
+      RATED_RPM: "3000"
+      FAULT_MODE: none
+    ports:
+      - "5020:5020"
+    depends_on:
+      mqtt:
+        condition: service_healthy
+
+  emulator-b:
+    build: ../machine-emulator
+    image: factory-mes/machine-emulator:local
+    restart: unless-stopped
+    environment:
+      <<: *emulator-env
+      MACHINE_CODE: MACHINE_B
+      CYCLE_SECONDS: "0.9"
+      RATED_RPM: "2400"
+      FAULT_MODE: bearing_overheat
+      FAULT_AFTER_SECONDS: "20"
+    ports:
+      - "5021:5020"
+    depends_on:
+      mqtt:
+        condition: service_healthy
+
+  # 현장 게이트웨이: PLC Modbus 폴링 ↔ MQTT
+  edge-gateway:
+    build: ../edge-gateway
+    image: factory-mes/edge-gateway:local
+    restart: unless-stopped
+    environment:
+      GATEWAY_ID: edge-gw-01
+      MACHINES: MACHINE_A=emulator-a:5020,MACHINE_B=emulator-b:5020
+      MQTT_HOST: mqtt
+    depends_on:
+      mqtt:
+        condition: service_healthy
+      emulator-a:
+        condition: service_started
+      emulator-b:
+        condition: service_started
+
+  influxdb:
+    image: influxdb:2.7
+    restart: unless-stopped
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USERNAME:-mes}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_PASSWORD:-mesmesmes}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-mes}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-sensors}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_ADMIN_TOKEN:-mes-dev-token}
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUX_RETENTION:-168h}
+    ports:
+      - "${INFLUX_PORT:-8086}:8086"
+    volumes:
+      - influx-data:/var/lib/influxdb2
+      - influx-config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mlflow:
+    build: ./mlflow
+    image: factory-mes/mlflow:local
+    restart: unless-stopped
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  sensor-collector:
+    build: ../sensor-collector
+    image: factory-mes/sensor-collector:local
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: mqtt
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_ADMIN_TOKEN:-mes-dev-token}
+      INFLUX_ORG: ${INFLUX_ORG:-mes}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:-sensors}
+      CORS_ORIGINS: '["http://localhost:3001"]'
+    ports:
+      - "8001:8001"
+    depends_on:
+      mqtt:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+
+  sensor-emulator:
+    build: ../sensor-emulator
+    image: factory-mes/sensor-emulator:local
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: mqtt
+      MES_URL: http://backend:8000
+      DATABASE_PATH: /data/emulator.db
+      CORS_ORIGINS: '["http://localhost:3001"]'
+    ports:
+      - "8002:8002"
+    volumes:
+      - sensor-emulator-data:/data
+    depends_on:
+      mqtt:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  analytics-backend:
+    build: ../analytics-backend
+    image: factory-mes/analytics-backend:local
+    user: root
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: mqtt
+      COLLECTOR_URL: http://sensor-collector:8001
+      MES_URL: http://backend:8000
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_DIR: /data
+      CORS_ORIGINS: '["http://localhost:3001"]'
+    volumes:
+      - analytics-models:/data
+    ports:
+      - "8003:8003"
+    depends_on:
+      mqtt:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      sensor-collector:
+        condition: service_started
+      backend:
+        condition: service_healthy
+
+  analytics-frontend:
+    build: ../analytics-frontend
+    image: factory-mes/analytics-frontend:local
+    restart: unless-stopped
+    environment:
+      COLLECTOR_URL: http://sensor-collector:8001
+      EMULATOR_URL: http://sensor-emulator:8002
+      ANALYTICS_URL: http://analytics-backend:8003
+      MES_URL: http://backend:8000
+    ports:
+      - "3001:3001"
+    depends_on:
+      sensor-collector:
+        condition: service_started
+      sensor-emulator:
+        condition: service_started
+      analytics-backend:
+        condition: service_started
+
+volumes:
+  mariadb-data:
+  mosquitto-data:
+  influx-data:
+  influx-config:
+  mlflow-data:
+  sensor-emulator-data:
+  analytics-models:
