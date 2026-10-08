@@ -129,3 +129,23 @@ CREATE TABLE IF NOT EXISTS sensor_readings (
   CONSTRAINT sensor_readings_ibfk_1 FOREIGN KEY (machine_id) REFERENCES machines (id),
   CONSTRAINT sensor_readings_ibfk_2 FOREIGN KEY (work_order_id) REFERENCES work_orders (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS machine_sensors (
+  id int(11) NOT NULL AUTO_INCREMENT,
+  machine_id int(11) NOT NULL,
+  code varchar(32) NOT NULL,
+  name varchar(64) NOT NULL,
+  sensor_type varchar(16) NOT NULL,
+  mount varchar(64) NOT NULL,
+  unit varchar(16) NOT NULL,
+  sample_rate int(11) NOT NULL,
+  n_samples int(11) NOT NULL,
+  interval_s int(11) NOT NULL,
+  preset varchar(32) NOT NULL,
+  severity float NOT NULL,
+  enabled tinyint(1) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_machine_sensor_code (machine_id, code),
+  KEY machine_id (machine_id),
+  CONSTRAINT machine_sensors_ibfk_1 FOREIGN KEY (machine_id) REFERENCES machines (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
